@@ -1,0 +1,12 @@
+# Blender 5.0.0 MTL File: 'domek.blend'
+# www.blender.org
+
+newmtl house
+Ka 1.000000 1.000000 1.000000
+Ks 0.500000 0.500000 0.500000
+Ke 0.000000 0.000000 0.000000
+Ni 1.500000
+d 1.000000
+illum 2
+map_Kd house_1_oil_stains.png
+map_Ks house_spec.png
