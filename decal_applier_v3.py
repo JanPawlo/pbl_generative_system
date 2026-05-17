@@ -1,4 +1,3 @@
-
 import copy
 import math
 import random
@@ -7,6 +6,7 @@ from pathlib import Path
 
 from PIL import Image
 
+from decal_projection import apply_decal_to_model
 from json_parser import extract_world_position, update_scene_models_in_text
 
 
@@ -50,66 +50,6 @@ def weighted_sample_without_replacement(items, weights, k, rng):
                 w[i] = 0.0
                 break
     return selected
-
-
-def is_power_of_two(n):
-    return n > 0 and (n & (n - 1)) == 0
-
-
-def upscale_texture_to_match(texture_img, target_size):
-    current_width, current_height = texture_img.size
-    target_width, target_height = target_size
-    width_ratio = target_width // current_width
-    height_ratio = target_height // current_height
-    if width_ratio != height_ratio:
-        scale_factor = max(width_ratio, height_ratio)
-    else:
-        scale_factor = width_ratio
-
-    upscaled = texture_img.resize(
-        (current_width * scale_factor, current_height * scale_factor),
-        Image.NEAREST,
-    )
-
-    if upscaled.size != target_size:
-        result = Image.new("RGBA", target_size, (0, 0, 0, 0))
-        x_offset = (target_width - upscaled.width) // 2
-        y_offset = (target_height - upscaled.height) // 2
-        result.paste(upscaled, (x_offset, y_offset))
-        return result
-    return upscaled
-
-
-def ensure_texture_compatibility(base_img, decal_img):
-    base_size = base_img.size
-    decal_size = decal_img.size
-    if base_size == decal_size:
-        return base_img, decal_img
-
-    base_pow2 = is_power_of_two(base_size[0]) and is_power_of_two(base_size[1])
-    decal_pow2 = is_power_of_two(decal_size[0]) and is_power_of_two(decal_size[1])
-
-    if base_pow2 and decal_pow2:
-        base_area = base_size[0] * base_size[1]
-        decal_area = decal_size[0] * decal_size[1]
-        if base_area < decal_area:
-            base_img = upscale_texture_to_match(base_img, decal_size)
-        else:
-            decal_img = upscale_texture_to_match(decal_img, base_size)
-        return base_img, decal_img
-
-    pow2_status = []
-    if not base_pow2:
-        pow2_status.append(f"base ({base_size[0]}x{base_size[1]})")
-    if not decal_pow2:
-        pow2_status.append(f"decal ({decal_size[0]}x{decal_size[1]})")
-    raise ValueError(
-        f"Texture size mismatch: base={base_size}, decal={decal_size}. "
-        f"Cannot automatically resize because {' and '.join(pow2_status)} "
-        f"{'is' if len(pow2_status) == 1 else 'are'} not power-of-two dimensions. "
-        f"Please ensure both textures have dimensions that are powers of two "
-        f"(e.g., 256x256, 512x512, 1024x1024) for automatic resizing."
-    )
 
 
 def apply_decals(scene_data, scene_text, biomes, target_percent, assets_dir, output_dir, decal_dir, rng_state):
@@ -207,14 +147,17 @@ def apply_decals(scene_data, scene_text, biomes, target_percent, assets_dir, out
             obj_path.write_text("\n".join(new_lines))
 
         texture_path = dst_model_dir / (new_name + ".png")
-        base_img = Image.open(texture_path).convert("RGBA")
-        decal_img = Image.open(decal_path).convert("RGBA")
+
+        # --- 3D decal projection (replaces old flat alpha_composite) ---
         try:
-            base_img, decal_img = ensure_texture_compatibility(base_img, decal_img)
-            combined = Image.alpha_composite(base_img, decal_img)
-            combined.save(texture_path)
-        except ValueError as exc:
-            raise ValueError(f"Failed to apply decal to {new_name}: {exc}") from exc
+            apply_decal_to_model(
+                texture_path=texture_path,
+                obj_path=obj_path,
+                decal_path=decal_path,
+                biome=biome,
+            )
+        except Exception as exc:
+            raise ValueError(f"Failed to apply 3D decal to {new_name}: {exc}") from exc
 
         obj_dict["model"] = new_name
         model_updates[obj_id] = new_name
@@ -239,4 +182,3 @@ def apply_decals(scene_data, scene_text, biomes, target_percent, assets_dir, out
         "source_models": source_models,
         "output_dir": output_dir,
     }
-
