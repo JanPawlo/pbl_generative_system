@@ -4,20 +4,23 @@ decal_projection.py
 Implements 3D-aware decal application using the two-part texture mapping
 approach described in Bier & Sloan (1986), "Two-Part Texture Mappings".
 
-Mapping strategy: ISN/box (Intermediate Surface Normal, box intermediate surface)
-─────────────────────────────────────────────────────────────────────────────────
-The previous version used a single slide-projector (plane) pass, which only
-covered faces roughly perpendicular to the one chosen projection direction.
-On a cube this meant only top/bottom faces received the decal.
+Mapping strategy: centroid/sphere
+──────────────────────────────────────────────────────────────────────────────
+The previous ISN/box version surrounded the mesh with a bounding box and used
+six discrete face projections, producing hard seams at box edges where the
+arbitration switched between faces.
 
-ISN/box fixes this by surrounding the mesh with an axis-aligned bounding box
-and using SIX projectors — one per box face.  For each texel we compute which
-box face's inward normal is closest to the surface normal at that point
-(the arbitration scheme from the paper), then sample the decal from that face's
-projection.  This gives continuous, full-coverage results on any convex mesh
-(and acceptable results on mildly non-convex ones).
+centroid/sphere replaces the box intermediate surface with a bounding sphere.
+The O⁻¹ mapping fires a ray from the mesh centroid through each surface point
+and finds where it hits the sphere, giving continuous (θ, φ) spherical
+coordinates.  Those are converted to equirectangular decal UV with no seams.
 
-Public API (unchanged from previous version):
+Trade-off (as noted in the paper): the S mapping from the flat decal image
+onto the sphere has inherent stretch near the poles, but for decals covering
+most of the object this is typically far less noticeable than the hard face
+boundaries of the box approach.
+
+Public API (unchanged):
   parse_obj(obj_path)  ->  ObjMesh
   apply_decal_to_model(texture_path, obj_path, decal_path, biome)  ->  None
 """
@@ -129,132 +132,76 @@ def parse_obj(obj_path: Path) -> ObjMesh:
 
 
 # ---------------------------------------------------------------------------
-# ISN/box setup
+# centroid/sphere mapping
 # ---------------------------------------------------------------------------
 
-# Six outward-facing normals of an axis-aligned box, and a consistent up-hint
-# per face so the decal artwork has a predictable orientation everywhere.
-#
-#   index  face    normal      up-hint
-#     0    +X     [ 1, 0, 0]  [0, 1, 0]
-#     1    -X     [-1, 0, 0]  [0, 1, 0]
-#     2    +Y     [ 0, 1, 0]  [0, 0, 1]   (top)
-#     3    -Y     [ 0,-1, 0]  [0, 0, 1]   (bottom)
-#     4    +Z     [ 0, 0, 1]  [0, 1, 0]
-#     5    -Z     [ 0, 0,-1]  [0, 1, 0]
-
-_BOX_NORMALS: np.ndarray = np.array([
-    [ 1,  0,  0],
-    [-1,  0,  0],
-    [ 0,  1,  0],
-    [ 0, -1,  0],
-    [ 0,  0,  1],
-    [ 0,  0, -1],
-], dtype=np.float64)
-
-_BOX_UPS: np.ndarray = np.array([
-    [0, 1, 0],
-    [0, 1, 0],
-    [0, 0, 1],
-    [0, 0, 1],
-    [0, 1, 0],
-    [0, 1, 0],
-], dtype=np.float64)
-
-
 @dataclass
-class BoxDecalSetup:
-    """Pre-computed local frames for all six faces of the bounding box."""
-    centers:  np.ndarray   # (6, 3)
-    x_axes:   np.ndarray   # (6, 3)
-    y_axes:   np.ndarray   # (6, 3)
-    half_ws:  np.ndarray   # (6,)   half-width  along x_axis
-    half_hs:  np.ndarray   # (6,)   half-height along y_axis
+class SphereDecalSetup:
+    """Bounding sphere that wraps the mesh for centroid/sphere projection."""
+    centroid: np.ndarray   # (3,)  centre of the sphere
+    radius:   float
 
 
-def _build_box_setup(mesh: ObjMesh, padding: float = 0.0) -> BoxDecalSetup:
+def _rotate_vectors_y(vectors: np.ndarray, angle: float) -> np.ndarray:
+    """Rotate (N, 3) unit vectors around the Y axis by *angle* radians."""
+    if angle == 0.0:
+        return vectors
+    c = np.cos(angle)
+    s = np.sin(angle)
+    x = vectors[:, 0]
+    y = vectors[:, 1]
+    z = vectors[:, 2]
+    return np.stack([c * x + s * z, y, -s * x + c * z], axis=-1)
+
+
+def _build_sphere_setup(mesh: ObjMesh) -> SphereDecalSetup:
     """
-    Build a BoxDecalSetup that snugly wraps *mesh*.
-
-    padding expands the box on all sides so the projection stays well-defined
-    right up to the mesh boundary.  The paper recommends using a box with side
-    = sqrt(2) * sphere_radius for minimal data loss; here we use a proportional
-    padding on the actual bounding box.
+    Fit a bounding sphere to *mesh* using its centroid and the furthest vertex.
     """
-    lo = mesh.positions.min(axis=0) - padding
-    hi = mesh.positions.max(axis=0) + padding
-
-    cx, cy, cz = (lo + hi) / 2.0
-    hx, hy, hz = (hi - lo) / 2.0
-
-    centers = np.array([
-        [hi[0], cy,    cz   ],   # +X face
-        [lo[0], cy,    cz   ],   # -X face
-        [cx,    hi[1], cz   ],   # +Y face
-        [cx,    lo[1], cz   ],   # -Y face
-        [cx,    cy,    hi[2]],   # +Z face
-        [cx,    cy,    lo[2]],   # -Z face
-    ], dtype=np.float64)
-
-    # Each face spans two axes; map those to half_w / half_h
-    # ±X face: spans Y (width) × Z (height)
-    # ±Y face: spans X (width) × Z (height)
-    # ±Z face: spans X (width) × Y (height)
-    half_ws = np.array([hy, hy, hx, hx, hx, hx], dtype=np.float64)
-    half_hs = np.array([hz, hz, hz, hz, hy, hy], dtype=np.float64)
-
-    x_axes = np.empty((6, 3), dtype=np.float64)
-    y_axes = np.empty((6, 3), dtype=np.float64)
-    for i in range(6):
-        n  = _BOX_NORMALS[i]
-        up = _BOX_UPS[i]
-        x  = _normalize(np.cross(up, n))
-        y  = _normalize(np.cross(n, x))
-        x_axes[i] = x
-        y_axes[i] = y
-
-    return BoxDecalSetup(
-        centers=centers,
-        x_axes=x_axes,
-        y_axes=y_axes,
-        half_ws=half_ws,
-        half_hs=half_hs,
-    )
+    centroid = mesh.positions.mean(axis=0)
+    dists    = np.linalg.norm(mesh.positions - centroid, axis=1)
+    radius   = float(dists.max())
+    radius   = max(radius, 1e-4)
+    return SphereDecalSetup(centroid=centroid, radius=radius)
 
 
-def _arbitrate_face(surface_normals: np.ndarray) -> np.ndarray:
+def _project_to_sphere_uv(
+    pts:        np.ndarray,        # (N, 3)  3D surface points
+    setup:      SphereDecalSetup,
+    rotation_y: float = 0.0,
+) -> np.ndarray:                    # (N, 2)  decal UV in [0, 1]
     """
-    For each surface point pick the box face whose outward normal best aligns
-    with the surface normal (Bier & Sloan arbitration scheme).
+    centroid/sphere O⁻¹ mapping (Bier & Sloan §"Centroid/sphere").
 
-    surface_normals : (N, 3)
-    Returns         : (N,)  int  in [0, 5]
+    For each surface point, fire a ray from the centroid through the point and
+    find where it intersects the bounding sphere.  Convert the intersection's
+    spherical coordinates (θ, φ) to equirectangular UV.
+
+    O⁻¹: [xo, yo, zo]  →  r * [xo, yo, zo] / ||[xo, yo, zo]||
+
+    UV mapping:
+      u = (atan2(z, x) / (2π)) + 0.5   (longitude → [0, 1], seam at ±X)
+      v = acos(y / r) / π               (latitude  → [0, 1], 0=north, 1=south)
+
+    The only discontinuity is a single vertical seam at the ±X boundary
+    (where atan2 wraps), much less visible than the six box-face seams.
     """
-    dots = surface_normals @ _BOX_NORMALS.T   # (N, 6)
-    return np.argmax(dots, axis=1)            # (N,)
+    d = pts - setup.centroid              # (N, 3)  direction from centroid
 
+    # Normalise to get the unit direction, then scale to sphere surface
+    norms = np.linalg.norm(d, axis=1, keepdims=True)
+    norms = np.where(norms < 1e-12, 1.0, norms)
+    d_unit = d / norms                    # (N, 3)
+    if rotation_y != 0.0:
+        d_unit = _rotate_vectors_y(d_unit, rotation_y)
 
-def _project_to_face_uv(
-    pts:      np.ndarray,      # (N, 3)
-    face_ids: np.ndarray,      # (N,)
-    setup:    BoxDecalSetup,
-) -> np.ndarray:               # (N, 2)  decal UV in [0, 1]
-    """
-    Project each 3D point onto its assigned box face and return UV coordinates.
-    """
-    uv = np.empty((len(pts), 2), dtype=np.float64)
+    xs, ys, zs = d_unit[:, 0], d_unit[:, 1], d_unit[:, 2]
 
-    for fi in range(6):
-        mask = face_ids == fi
-        if not mask.any():
-            continue
-        d  = pts[mask] - setup.centers[fi]
-        xa = d @ setup.x_axes[fi]
-        ya = d @ setup.y_axes[fi]
-        uv[mask, 0] = xa / (2.0 * setup.half_ws[fi]) + 0.5
-        uv[mask, 1] = ya / (2.0 * setup.half_hs[fi]) + 0.5
+    # Spherical → equirectangular UV
+    u = np.arctan2(zs, xs) / (2.0 * np.pi) + 0.5   # longitude [0, 1]
+    v = np.arccos(np.clip(ys, -1.0, 1.0)) / np.pi   # latitude  [0, 1]
 
-    return uv
+    return np.stack([u, v], axis=-1)                  # (N, 2)
 
 
 # ---------------------------------------------------------------------------
@@ -371,51 +318,43 @@ def _bilinear_sample(
 # ---------------------------------------------------------------------------
 
 def apply_decal_3d(
-    base_img:  Image.Image,
-    decal_img: Image.Image,
-    mesh:      ObjMesh,
-    biome:     dict,
+    base_img:     Image.Image,
+    decal_img:    Image.Image,
+    mesh:         ObjMesh,
+    biome:        dict,
+    rotation_y:   float = 0.0,
 ) -> Image.Image:
     """
-    Apply *decal_img* onto *base_img* using ISN/box mapping.
+    Apply *decal_img* onto *base_img* using centroid/sphere mapping.
 
     Steps
     -----
-    1. Rasterise the OBJ UV atlas to get per-texel 3D positions and normals.
-    2. Build an axis-aligned bounding box around the mesh (with sqrt(2) padding).
-    3. For each texel, pick the box face whose normal best matches the surface
-       normal (arbitration).
-    4. Project the texel's 3D point onto that face to get decal [xa, ya].
-    5. Bilinear-sample the decal; alpha-composite over the base texture.
+    1. Rasterise the OBJ UV atlas to get per-texel 3D positions.
+    2. Fit a bounding sphere to the mesh.
+    3. For each texel, fire a ray from the sphere centroid through the surface
+       point and convert the intersection to equirectangular (θ, φ) UV.
+    4. Bilinear-sample the decal; alpha-composite over the base texture.
     """
     tex_w, tex_h = base_img.size
     dec_w, dec_h = decal_img.size
 
-    # 1. UV atlas -> 3D positions + normals
-    pos3d, surf_normals = _build_uv_to_3d_map(mesh, tex_w, tex_h)
+    # 1. UV atlas -> 3D positions (normals not needed for centroid/sphere)
+    pos3d, _ = _build_uv_to_3d_map(mesh, tex_w, tex_h)
 
     valid_mask = ~np.isnan(pos3d[..., 0])
     valid_pts  = pos3d[valid_mask].astype(np.float64)
-    valid_nrm  = surf_normals[valid_mask].astype(np.float64)
 
     if valid_pts.shape[0] == 0:
         return base_img.copy()
 
-    # 2. Bounding box — pad by (sqrt(2)/2 - 0.5) * max_extent so the box
-    #    side is approximately sqrt(2) * half-extent, per the paper's advice.
-    extents = mesh.positions.max(axis=0) - mesh.positions.min(axis=0)
-    padding = float(np.max(extents)) * (np.sqrt(2.0) / 2.0 - 0.5)
-    padding = max(padding, 1e-4)
-    setup = _build_box_setup(mesh, padding=padding)
+    # 2. Bounding sphere
+    setup = _build_sphere_setup(mesh)
 
-    # 3. Arbitrate: choose which box face each texel belongs to
-    face_ids = _arbitrate_face(valid_nrm)
-
-    # 4. Project onto box face -> decal UV
-    decal_uv = _project_to_face_uv(valid_pts, face_ids, setup)
+    # 3. Project onto sphere -> equirectangular decal UV
+    decal_uv = _project_to_sphere_uv(valid_pts, setup, rotation_y=rotation_y)
 
     dec_px_x = (decal_uv[:, 0] * dec_w - 0.5).astype(np.float32)
-    dec_px_y = ((1.0 - decal_uv[:, 1]) * dec_h - 0.5).astype(np.float32)
+    dec_px_y = (decal_uv[:, 1] * dec_h - 0.5).astype(np.float32)
 
     # 5. Sample decal and composite
     decal_arr = np.array(decal_img, dtype=np.float32)
@@ -442,13 +381,14 @@ def apply_decal_to_model(
     obj_path:     Path,
     decal_path:   Path,
     biome:        dict,
+    rotation_y:   float = 0.0,
 ) -> None:
     """
-    Load the model texture, apply the decal via ISN/box projection, save in place.
+    Load the model texture, apply the decal via centroid/sphere projection, save in place.
     Drop-in replacement for the old flat alpha_composite approach.
     """
     mesh      = parse_obj(obj_path)
     base_img  = Image.open(texture_path).convert("RGBA")
     decal_img = Image.open(decal_path).convert("RGBA")
-    result    = apply_decal_3d(base_img, decal_img, mesh, biome)
+    result    = apply_decal_3d(base_img, decal_img, mesh, biome, rotation_y=rotation_y)
     result.save(texture_path)
