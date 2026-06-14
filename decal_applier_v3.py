@@ -149,12 +149,14 @@ def apply_decals(scene_data, scene_text, biomes, target_percent, assets_dir, out
         texture_path = dst_model_dir / (new_name + ".png")
 
         # --- 3D decal projection (replaces old flat alpha_composite) ---
+        rotation_y = rng.uniform(0.0, 2.0 * math.pi)
         try:
             apply_decal_to_model(
                 texture_path=texture_path,
                 obj_path=obj_path,
                 decal_path=decal_path,
                 biome=biome,
+                rotation_y=rotation_y,
             )
         except Exception as exc:
             raise ValueError(f"Failed to apply 3D decal to {new_name}: {exc}") from exc
