@@ -6,7 +6,7 @@ from pathlib import Path
 
 from PIL import Image
 
-from decal_projection import apply_decal_to_model
+from decal_projection import apply_decal_to_model, read_decal_mode
 from json_parser import extract_world_position, update_scene_models_in_text
 
 
@@ -148,8 +148,9 @@ def apply_decals(scene_data, scene_text, biomes, target_percent, assets_dir, out
 
         texture_path = dst_model_dir / (new_name + ".png")
 
-        # --- 3D decal projection (replaces old flat alpha_composite) ---
-        rotation_y = rng.uniform(0.0, 2.0 * math.pi)
+        # --- Determine decal mode from MTL comment, then apply ---
+        decal_mode = read_decal_mode(mtl_path) if mtl_path.exists() else "sphere"
+        rotation_y = 0.0 if decal_mode == "flat" else rng.uniform(0.0, 2.0 * math.pi)
         try:
             apply_decal_to_model(
                 texture_path=texture_path,
@@ -157,6 +158,7 @@ def apply_decals(scene_data, scene_text, biomes, target_percent, assets_dir, out
                 decal_path=decal_path,
                 biome=biome,
                 rotation_y=rotation_y,
+                mode=decal_mode,
             )
         except Exception as exc:
             raise ValueError(f"Failed to apply 3D decal to {new_name}: {exc}") from exc

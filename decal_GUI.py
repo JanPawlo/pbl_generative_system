@@ -28,6 +28,17 @@ from json_parser import parse_scene_file
 DEFAULT_DECAL_DIR = Path("decals/")
 DEFAULT_OUTPUT_DIR = Path("output_models/")
 
+# Default starting directories for file dialogs
+_DESKTOP = Path.home() / "Desktop"
+DEFAULT_SCENE_DIR   = _DESKTOP / "FishEngine" / "res" / "scenes"
+DEFAULT_MODELS_DIR  = _DESKTOP / "FishEngine" / "res" / "models"
+DEFAULT_DECALS_DIR  = _DESKTOP / "pbl_generative_system" / "decals"
+
+
+def _existing_dir(path: Path) -> str:
+    """Return path as string if it exists, else home directory string."""
+    return str(path) if path.is_dir() else str(Path.home())
+
 
 class DecalApp:
     def __init__(self, master):
@@ -102,6 +113,7 @@ class DecalApp:
     def load_scene(self):
         filename = filedialog.askopenfilename(
             title="Open Scene JSON",
+            initialdir=_existing_dir(DEFAULT_SCENE_DIR),
             filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
         )
         if not filename:
@@ -198,10 +210,20 @@ class DecalApp:
             command=lambda v: self.on_slider_change(),
         ).pack(fill="x", padx=10)
 
-        Label(right_frame, text="Biome Decal File:").pack(anchor="w", padx=10)
-        self.decal_file_var = StringVar(value="")
-        Entry(right_frame, textvariable=self.decal_file_var, state="readonly").pack(fill="x", padx=10)
-        Button(right_frame, text="Choose Decal...", command=self.choose_decal).pack(pady=2)
+        Label(right_frame, text="Biome Decals:").pack(anchor="w", padx=10)
+        decal_list_frame = Frame(right_frame)
+        decal_list_frame.pack(fill="x", padx=10)
+        self.decal_listbox = Listbox(decal_list_frame, height=4, exportselection=0)
+        self.decal_listbox.pack(side="left", fill="x", expand=True)
+        decal_scroll = __import__("tkinter").Scrollbar(decal_list_frame, orient="vertical",
+                                                       command=self.decal_listbox.yview)
+        decal_scroll.pack(side="right", fill="y")
+        self.decal_listbox.config(yscrollcommand=decal_scroll.set)
+
+        decal_btn_frame = Frame(right_frame)
+        decal_btn_frame.pack(fill="x", padx=10, pady=(2, 0))
+        Button(decal_btn_frame, text="Add Decal...", command=self.choose_decal).pack(side="left", padx=2)
+        Button(decal_btn_frame, text="Remove Selected", command=self.remove_decal).pack(side="left", padx=2)
 
         Label(right_frame, text="Target % affected (0-100):").pack(anchor="w", padx=10, pady=(20, 0))
         Scale(
@@ -364,7 +386,7 @@ class DecalApp:
             "intensity": 0.7,
             "near_threshold": 1.05,
             "second_chance": 0.25,
-            "decals": [self.decal_file_var.get()] if self.decal_file_var.get() else [],
+            "decals": [],
         }
         self.biomes.append(new_biome)
         self.update_biome_listbox()
@@ -403,7 +425,7 @@ class DecalApp:
         self.intensity_var.set(b["intensity"])
         self.near_threshold_var.set(b["near_threshold"])
         self.second_chance_var.set(b["second_chance"])
-        self.decal_file_var.set(b["decals"][0] if b["decals"] else "")
+        self._refresh_decal_listbox(b["decals"])
         self.update_biome_listbox()
 
     def on_slider_change(self, *args):
@@ -414,21 +436,42 @@ class DecalApp:
             b["second_chance"] = self.second_chance_var.get()
             self.redraw()
 
+    def _refresh_decal_listbox(self, decals):
+        self.decal_listbox.delete(0, END)
+        for d in decals:
+            self.decal_listbox.insert(END, d)
+
     def choose_decal(self):
         f = filedialog.askopenfilename(
             title="Select Decal Image",
+            initialdir=_existing_dir(DEFAULT_DECALS_DIR),
             filetypes=[("PNG files", "*.png"), ("All files", "*.*")],
         )
         if f:
-            self.decal_file_var.set(Path(f).name)
+            name = Path(f).name
             if self.selected_biome_idx is not None and 0 <= self.selected_biome_idx < len(self.biomes):
-                self.biomes[self.selected_biome_idx]["decals"] = [Path(f).name]
+                decals = self.biomes[self.selected_biome_idx]["decals"]
+                if name not in decals:
+                    decals.append(name)
+                self._refresh_decal_listbox(decals)
+
+    def remove_decal(self):
+        if self.selected_biome_idx is None or self.selected_biome_idx >= len(self.biomes):
+            return
+        sel = self.decal_listbox.curselection()
+        if not sel:
+            return
+        decals = self.biomes[self.selected_biome_idx]["decals"]
+        idx = sel[0]
+        if 0 <= idx < len(decals):
+            decals.pop(idx)
+        self._refresh_decal_listbox(decals)
 
     def clear_sliders(self):
         self.intensity_var.set(0.0)
         self.near_threshold_var.set(1.0)
         self.second_chance_var.set(0.0)
-        self.decal_file_var.set("")
+        self.decal_listbox.delete(0, END)
 
     def on_press(self, event):
         item = self.canvas.find_closest(event.x, event.y)
@@ -508,7 +551,10 @@ class DecalApp:
         output_dir = self.output_dir
 
         if not hasattr(self, "assets_dir") or not Path(self.assets_dir).is_dir():
-            d = filedialog.askdirectory(title="Select Original Assets (models) Folder")
+            d = filedialog.askdirectory(
+                title="Select Original Assets (models) Folder",
+                initialdir=_existing_dir(DEFAULT_MODELS_DIR),
+            )
             if not d:
                 return
             self.assets_dir = d

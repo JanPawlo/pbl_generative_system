@@ -373,8 +373,52 @@ def apply_decal_3d(
 
 
 # ---------------------------------------------------------------------------
-# Public wrapper (API unchanged from previous version)
+# Flat (tiled-UV) decal apply — simple alpha-composite with rotation
 # ---------------------------------------------------------------------------
+
+def apply_decal_flat(
+    base_img:   Image.Image,
+    decal_img:  Image.Image,
+) -> Image.Image:
+    """
+    Apply *decal_img* onto *base_img* by scaling the decal to fill the texture
+    and alpha-compositing the result. No rotation, no 3D projection.
+
+    Suitable for tiled-UV objects where every face already shows the full
+    texture and should receive the same decal stamp.
+    """
+    tex_w, tex_h = base_img.size
+    scaled = decal_img.resize((tex_w, tex_h), Image.Resampling.LANCZOS)
+    result = base_img.copy().convert("RGBA")
+    result.alpha_composite(scaled.convert("RGBA"))
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Public wrapper
+# ---------------------------------------------------------------------------
+
+def read_decal_mode(mtl_path: Path) -> str:
+    """
+    Read the first  '# decal_mode <mode>'  comment from an MTL file.
+    Returns 'sphere' if no such comment is found (safe default).
+
+    To mark a model as flat/tiled, add this line anywhere in its .mtl file:
+        # decal_mode flat
+    To use the sphere projection explicitly (or by default), use:
+        # decal_mode sphere
+    """
+    try:
+        for raw in mtl_path.read_text(encoding="utf-8", errors="replace").splitlines():
+            line = raw.strip()
+            if line.startswith("# decal_mode"):
+                parts = line.split()
+                if len(parts) >= 3:
+                    return parts[2].lower()
+    except OSError:
+        pass
+    return "sphere"
+
 
 def apply_decal_to_model(
     texture_path: Path,
@@ -382,13 +426,24 @@ def apply_decal_to_model(
     decal_path:   Path,
     biome:        dict,
     rotation_y:   float = 0.0,
+    mode:         str   = "sphere",
 ) -> None:
     """
-    Load the model texture, apply the decal via centroid/sphere projection, save in place.
-    Drop-in replacement for the old flat alpha_composite approach.
+    Load the model texture, apply the decal, and save in place.
+
+    mode='sphere'  →  centroid/sphere 3D projection (default, complex meshes)
+    mode='flat'    →  direct alpha-composite with rotation (tiled-UV objects)
+
+    The mode is normally determined by  read_decal_mode(mtl_path)  in the
+    caller; pass it explicitly here so this function stays side-effect-free.
     """
-    mesh      = parse_obj(obj_path)
     base_img  = Image.open(texture_path).convert("RGBA")
     decal_img = Image.open(decal_path).convert("RGBA")
-    result    = apply_decal_3d(base_img, decal_img, mesh, biome, rotation_y=rotation_y)
+
+    if mode == "flat":
+        result = apply_decal_flat(base_img, decal_img)
+    else:
+        mesh   = parse_obj(obj_path)
+        result = apply_decal_3d(base_img, decal_img, mesh, biome, rotation_y=rotation_y)
+
     result.save(texture_path)
